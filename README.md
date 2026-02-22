@@ -112,6 +112,8 @@ uv run bunko_ocr.py image1.jpg image2.jpg
   --output-dir PATH      出力ディレクトリ（path.config の設定より優先）
   --override             既存の出力ファイルを上書きする
   -v, --verbose          OCRengine の出力を表示する（デバッグ用）
+  -j N, --workers N      並列ワーカー数（デフォルト: 1）。N>1 で N 個の OCRengine.exe を並列起動する
+  --restart-after N      N 枚ごとに OCRengine.exe を再起動する（デフォルト: 30、0 で無効）
   --doctor               動作に必要なファイルの存在を確認する
 ```
 
@@ -141,11 +143,21 @@ uv run bunko_ocr.py -v image.jpg
 uv run bunko_ocr.py --override image.jpg
 ```
 
-Git Bash 環境であれば Linux コマンドラインツールを活用し以下のように並列実行も可能です。bunko_ocr.py の 1 インスタンス毎に GPU メモリを 1.8GB 程度消費します。タスクマネージャーで GPU メモリの空きを確認し、最適な並列数を xargs -P の数字として指定してください。
+**並列処理で高速化する（複数 OCRengine.exe を同時起動）:**
 
+```bash
+uv run bunko_ocr.py -j 4 *.jpg
 ```
-ls *.jpg | xargs -L50 -P4 uv run /path/to/ocr/bunko_ocr.py
+
+`-j N` を指定すると N 個の `OCRengine.exe` を並列起動し、画像を分散処理します。1 インスタンスあたり GPU メモリを約 1.8GB 消費するため、タスクマネージャーで空き容量を確認してから並列数を決めてください。
+
+**エンジンを定期的に再起動する:**
+
+```bash
+uv run bunko_ocr.py -j 4 --restart-after 50 *.jpg
 ```
+
+`--restart-after N` を指定すると N 枚処理するごとに `OCRengine.exe` を再起動します（デフォルト 30、0 で無効）。長時間実行時のメモリリークを防ぐ用途に使います。
 
 ## 出力ファイル
 
