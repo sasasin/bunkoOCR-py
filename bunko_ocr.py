@@ -15,6 +15,8 @@ param.config / ruby.config / path.config は bunkoOCR.exe で作成済みのも�
 """
 
 import argparse
+import concurrent.futures
+import glob as glob_module
 import json
 import os
 import queue
@@ -23,6 +25,28 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# グロブ展開（Windows CMD / PowerShell では自動展開されないため）
+# ---------------------------------------------------------------------------
+
+def expand_globs(patterns: list[str]) -> list[str]:
+    """Windows CMD/PowerShell ではグロブが展開されないため Python 側で展開する。
+
+    - グロブ文字（* ? [）を含むパターンは glob.glob() で展開する。
+    - 一致するファイルが存在しない場合はそのまま保持する（後続で警告を出す）。
+    - グロブ文字を含まない文字列はそのまま保持する。
+    - 展開結果はパターンごとにソート済み。
+    """
+    result: list[str] = []
+    for pattern in patterns:
+        if any(c in pattern for c in ("*", "?", "[")):
+            matches = sorted(glob_module.glob(pattern))
+            result.extend(matches if matches else [pattern])
+        else:
+            result.append(pattern)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +235,7 @@ def _apply_ruby(text: str, output_ruby: bool, before: str, sep: str, after: str)
         )
 
 
-def postprocess(input_file: str, json_path: Path, ruby_cfg: dict[str, str]) -> None:
+def postprocess(input_file: str, json_path: Path, ruby_cfg: dict[str, str], prefix: str = "") -> None:
     """
     OCRengine が出力した JSON を読み込み、ルビ変換・再書き込み・txt 出力を行う
     （Form1.cs postprocess の再現）。
@@ -250,9 +274,9 @@ def postprocess(input_file: str, json_path: Path, ruby_cfg: dict[str, str]) -> N
         txt_path = json_path.with_suffix(".txt")
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write(result.get("text", ""))
-        print(f"  → {txt_path}", file=sys.stderr)
+        print(f"{prefix}  → {txt_path}", file=sys.stderr)
 
-    print(f"  → {json_path}", file=sys.stderr)
+    print(f"{prefix}  → {json_path}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +365,12 @@ def run_doctor(engine_dir: Path, config_dir: Path) -> int:
 # stdout 読み込みスレッド
 # ---------------------------------------------------------------------------
 
-def _stdout_reader(proc: subprocess.Popen, out_queue: queue.Queue, verbose: bool) -> None:
+def _stdout_reader(proc: subprocess.Popen, out_queue: queue.Queue, verbose: bool, prefix: str = "") -> None:
     """OCRengine の stdout を行単位で読み込み、キューに積む。"""
     for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
         if verbose:
-            print(f"[engine] {line}", file=sys.stderr)
+            print(f"{prefix}[engine] {line}", file=sys.stderr)
         out_queue.put(line)
     out_queue.put(None)  # 終端シグナル
 
@@ -362,8 +386,10 @@ def run_ocr(
     output_dir: str,
     override: bool,
     verbose: bool,
+    worker_id: int = 0,
 ) -> int:
     """OCR パイプラインを実行する。成功なら 0、失敗があれば 1 を返す。"""
+    pfx = f"[W{worker_id}] " if worker_id > 0 else ""
 
     # 設定読み込み
     params = load_param_config(config_dir)
@@ -383,7 +409,7 @@ def run_ocr(
     for img in image_files:
         p = Path(img)
         if not p.exists():
-            print(f"WARNING: ファイルが見つかりません、スキップします: {img}", file=sys.stderr)
+            print(f"{pfx}WARNING: ファイルが見つかりません、スキップします: {img}", file=sys.stderr)
             continue
         # 絶対パスで送信する（エンジンの cwd に依存しないよう）
         abs_input = str(p.resolve())
@@ -391,19 +417,19 @@ def run_ocr(
         file_map[abs_input] = out_path
 
     if not file_map:
-        print("処理対象の画像ファイルがありません。", file=sys.stderr)
+        print(f"{pfx}処理対象の画像ファイルがありません。", file=sys.stderr)
         return 1
 
     # OCRengine.exe の存在確認
     engine_exe = engine_dir / "OCRengine.exe"
     if not engine_exe.exists():
-        print(f"ERROR: OCRengine.exe が見つかりません: {engine_exe}", file=sys.stderr)
+        print(f"{pfx}ERROR: OCRengine.exe が見つかりません: {engine_exe}", file=sys.stderr)
         return 1
 
     cmd = [str(engine_exe)] + engine_args
     if verbose:
-        print(f"[engine] 起動: {' '.join(cmd)}", file=sys.stderr)
-        print(f"[engine] cwd: {engine_dir}", file=sys.stderr)
+        print(f"{pfx}[engine] 起動: {' '.join(cmd)}", file=sys.stderr)
+        print(f"{pfx}[engine] cwd: {engine_dir}", file=sys.stderr)
 
     proc = subprocess.Popen(
         cmd,
@@ -416,7 +442,7 @@ def run_ocr(
     out_queue: queue.Queue = queue.Queue()
     reader_thread = threading.Thread(
         target=_stdout_reader,
-        args=(proc, out_queue, verbose),
+        args=(proc, out_queue, verbose, pfx),
         daemon=True,
     )
     reader_thread.start()
@@ -426,17 +452,17 @@ def run_ocr(
     proc.stdin.flush()
 
     # "ready" を待機
-    print("OCR エンジンの初期化を待っています...", file=sys.stderr)
+    print(f"{pfx}OCR エンジンの初期化を待っています...", file=sys.stderr)
     while True:
         line = out_queue.get()
         if line is None:
-            print("ERROR: エンジンが ready になる前に終了しました。", file=sys.stderr)
+            print(f"{pfx}ERROR: エンジンが ready になる前に終了しました。", file=sys.stderr)
             proc.wait()
             return 1
         if line == "ready":
             break
 
-    print(f"エンジン準備完了。{len(file_map)} 件の画像を処理します...", file=sys.stderr)
+    print(f"{pfx}エンジン準備完了。{len(file_map)} 件の画像を処理します...", file=sys.stderr)
 
     # 画像ペアを送信
     for input_str, out_path in file_map.items():
@@ -463,7 +489,7 @@ def run_ocr(
             # エンジンが終了した（未受信の画像がある場合はエラー）
             if pending:
                 print(
-                    f"ERROR: エンジンが終了しましたが {len(pending)} 件の結果を受信できませんでした。",
+                    f"{pfx}ERROR: エンジンが終了しましたが {len(pending)} 件の結果を受信できませんでした。",
                     file=sys.stderr,
                 )
             break
@@ -472,7 +498,7 @@ def run_ocr(
             done_filename = line[len("done: "):]
             pending.discard(done_filename)
             processed += 1
-            print(f"[{processed}/{total}] 完了: {done_filename}", file=sys.stderr)
+            print(f"{pfx}[{processed}/{total}] 完了: {done_filename}", file=sys.stderr)
 
             # 対応する出力パスを解決
             out_path = file_map.get(done_filename)
@@ -488,22 +514,46 @@ def run_ocr(
             pending.discard(err_filename)
             error_count += 1
             processed += 1
-            print(f"[{processed}/{total}] ERROR: {err_filename}", file=sys.stderr)
+            print(f"{pfx}[{processed}/{total}] ERROR: {err_filename}", file=sys.stderr)
 
     proc.wait()
     reader_thread.join(timeout=5)
 
     # ポストプロセス
     if done_files:
-        print("ポストプロセス中...", file=sys.stderr)
+        print(f"{pfx}ポストプロセス中...", file=sys.stderr)
         for input_file, json_path in done_files:
-            postprocess(input_file, json_path, ruby_cfg)
+            postprocess(input_file, json_path, ruby_cfg, pfx)
 
     print(
-        f"完了: {len(done_files)} 件成功、{error_count} 件失敗",
+        f"{pfx}完了: {len(done_files)} 件成功、{error_count} 件失敗",
         file=sys.stderr,
     )
     return 0 if error_count == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# 並列処理ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _chunk_images(images: list[str], n: int) -> list[list[str]]:
+    """images を最大 n 個の contiguous chunks に分割する。空チャンクは生成しない。
+
+    例: 10画像, n=3 → [4, 3, 3]
+        2画像,  n=5 → [1, 1]  (n > len の場合は len に切り詰め)
+    """
+    total = len(images)
+    actual_n = min(n, total)
+    if actual_n <= 0:
+        return []
+    base, remainder = divmod(total, actual_n)
+    chunks: list[list[str]] = []
+    start = 0
+    for i in range(actual_n):
+        size = base + (1 if i < remainder else 0)
+        chunks.append(images[start : start + size])
+        start += size
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -555,12 +605,22 @@ def main() -> int:
         help="OCRengine の出力を stderr に表示する",
     )
     parser.add_argument(
+        "-j", "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="並列ワーカー数（デフォルト: 1）。N>1 で N 個の OCRengine.exe を並列起動する",
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="動作に必要なファイルの存在を確認して結果を表示する",
     )
 
     args = parser.parse_args()
+
+    # Windows CMD/PowerShell ではグロブが展開されないため Python 側で展開する
+    images = expand_globs(args.images)
 
     script_dir = Path(__file__).parent
     engine_dir = Path(args.engine_dir) if args.engine_dir else script_dir
@@ -569,7 +629,7 @@ def main() -> int:
     if args.doctor:
         return run_doctor(engine_dir, config_dir)
 
-    if not args.images:
+    if not images:
         parser.error("処理する IMAGE を1つ以上指定してください（または --doctor で環境チェック）")
 
     # path.config から output_dir / override を読み込み、CLI 引数で上書き
@@ -577,14 +637,54 @@ def main() -> int:
     output_dir = args.output_dir if args.output_dir is not None else path_cfg["output_dir"]
     override = args.override or (path_cfg["override"] == "1")
 
-    return run_ocr(
-        image_files=args.images,
-        engine_dir=engine_dir,
-        config_dir=config_dir,
-        output_dir=output_dir,
-        override=override,
-        verbose=args.verbose,
-    )
+    workers = max(1, args.workers)
+
+    if workers == 1:
+        return run_ocr(
+            image_files=images,
+            engine_dir=engine_dir,
+            config_dir=config_dir,
+            output_dir=output_dir,
+            override=override,
+            verbose=args.verbose,
+            worker_id=0,
+        )
+
+    # 並列モード
+    chunks = _chunk_images(images, workers)
+    actual_workers = len(chunks)
+
+    if actual_workers < workers:
+        print(
+            f"INFO: 画像数 ({len(images)}) がワーカー数 ({workers}) より少ないため、"
+            f"{actual_workers} ワーカーで実行します。",
+            file=sys.stderr,
+        )
+
+    results: list[int] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        future_to_wid = {
+            executor.submit(
+                run_ocr,
+                image_files=chunk,
+                engine_dir=engine_dir,
+                config_dir=config_dir,
+                output_dir=output_dir,
+                override=override,
+                verbose=args.verbose,
+                worker_id=wid + 1,
+            ): wid + 1
+            for wid, chunk in enumerate(chunks)
+        }
+        for future in concurrent.futures.as_completed(future_to_wid):
+            wid = future_to_wid[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"[W{wid}] 予期しないエラー: {exc}", file=sys.stderr)
+                results.append(1)
+
+    return 0 if all(r == 0 for r in results) else 1
 
 
 if __name__ == "__main__":
